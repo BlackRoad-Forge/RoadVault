@@ -1,0 +1,85 @@
+name: GHCR Cleanup
+
+on:
+  schedule:
+    - cron: "0 4 * * 0" # Every Sunday at 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "List versions that would be deleted without actually deleting them"
+        type: boolean
+        default: true
+
+jobs:
+  cleanup:
+    name: Clean up old GHCR images
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - name: Delete image versions older than 30 days
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          OWNER="bitwarden"
+          PACKAGES=(
+            admin api attachments billing events eventsprocessor
+            icons identity mssql mssqlmigratorutility nginx notifications
+            scim seederapi setup sso
+          )
+
+          # Tags that must never be deleted regardless of age:
+          #   dev        - latest main build
+          #   rc         - release candidate
+          #   hotfix-rc  - hotfix release candidate
+          #   dryrun     - publish dry-run
+          #   YYYY.N.N   - versioned releases (e.g. 2026.3.1)
+          KEEP_PATTERN="^(dev|rc|hotfix-rc|dryrun|[0-9]{4}\.[0-9]+\.[0-9]+)"
+
+          DRY_RUN="${{ inputs.dry-run }}"
+          # Scheduled runs always delete; workflow_dispatch defaults to dry-run
+          if [[ -z "$DRY_RUN" ]]; then
+            DRY_RUN="false"
+          fi
+
+          CUTOFF=$(date -d "30 days ago" -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "Cutoff date: $CUTOFF"
+          echo "Dry run: $DRY_RUN"
+
+          for PACKAGE in "${PACKAGES[@]}"; do
+            echo ""
+            echo "=== $PACKAGE ==="
+
+            gh api --paginate \
+              --jq '.[] | {id: .id, created_at: .created_at, tags: .metadata.container.tags}' \
+              "orgs/${OWNER}/packages/container/${PACKAGE}/versions" \
+            | while IFS= read -r version; do
+              VERSION_ID=$(echo "$version" | jq -r '.id')
+              CREATED_AT=$(echo "$version" | jq -r '.created_at')
+
+              # Skip versions newer than the cutoff
+              [[ "$CREATED_AT" > "$CUTOFF" ]] && continue
+
+              # Skip if any tag on this version is permanent
+              KEEP=false
+              while IFS= read -r tag; do
+                if [[ -n "$tag" ]] && echo "$tag" | grep -qE "$KEEP_PATTERN"; then
+                  KEEP=true
+                  break
+                fi
+              done < <(echo "$version" | jq -r '.tags[]?')
+              [[ "$KEEP" == "true" ]] && continue
+
+              TAGS_DISPLAY=$(echo "$version" | jq -r '[.tags[]?] | join(", ")')
+              if [[ "$DRY_RUN" == "true" ]]; then
+                echo "[DRY RUN] Would delete ${PACKAGE}@${VERSION_ID} (tags: [${TAGS_DISPLAY:-untagged}], created: ${CREATED_AT})"
+              else
+                echo "Deleting ${PACKAGE}@${VERSION_ID} (tags: [${TAGS_DISPLAY:-untagged}], created: ${CREATED_AT})"
+                gh api --method DELETE \
+                  "orgs/${OWNER}/packages/container/${PACKAGE}/versions/${VERSION_ID}" || \
+                  echo "  WARNING: failed to delete ${VERSION_ID}, skipping"
+              fi
+            done
+          done
